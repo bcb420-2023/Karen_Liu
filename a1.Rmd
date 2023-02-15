@@ -1,0 +1,314 @@
+---
+title: "Assignment 1"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Cancer is the leading cause of death in Canada (Canadian Cancer Association, n.d.), with 11% of all deaths being attributed to colorectal cancer (Canadian Cancer Association, 2022). In particular, the development of drug resistance in the late stages of colorectal cancer often nullifies the effect of certain treatments (Charitou et al., 2019). As this is found to be a key player in poor survival outcomes, it is imperative that alternative drug targets and therapeutics be identified and formulated. 
+
+In the paper "Transcriptional and metabolic rewiring of colorectal cancer cells expressing the oncogenic KRASG13D mutation" (Charitou et al., 2019), the authors identify mutations in the proto-oncogene KRAS as a particularly important factor in cancer progression and the cancer cell's development of drug resistance. However, as KRAS is currently not a viable therapeutic target, the authors focus on the downstream effects of KRAS and potential therapeutic targets in these altered pathways. One of the genes that are upregulated by KRAS is transforming growth factor alpha (TGF$\alpha$), which has been implicated as a cancer driver in colorectal cancer. Thus, investigation into how TGF$\alpha$ affects the transcriptional landscape of cancer cells may reveal potential drug targets for colorectal cancer. 
+
+Here, we introduce a bulk RNAseq dataset by the authors of this paper (GEO Accession: GSE105094). Using two lines of colorectal cancer cells (HCT116 and HKE3), the authors performed a time-course experiment by treating the cells with TGF$\alpha$ and taking samples before treatment (t = 0), and at five different time points measured in minutes post-treatment (t = 30, 60, 90, and 120). Thus, we will use this dataset to perform differential expression analysis between the control condition (the colorectal cancer cell lines before stimulation with TGF$\alpha$), and the test conditions (the colorectal cancer cell lines after stimulation with TGF$\alpha$). 
+
+## Installing Relevant Packages
+```{r, warning=FALSE}
+if(!requireNamespace("knitr", quietly=TRUE))
+  install.packages("knitr")
+
+if (! require("BiocManager", quietly=TRUE))
+  install.packages("BiocManager")
+
+if(! requireNamespace("edgeR", quietly=TRUE))
+  BiocManager::install("edgeR")
+
+if(! requireNamespace("biomaRt", quietly=TRUE))
+  BiocManager::install("biomaRt")
+
+if (!requireNamespace("GEOquery", quietly=TRUE))
+  BiocManager::install("GEOquery")
+```
+
+
+<br>
+
+# Clean the data and map to HUGO symbols
+
+## Downloading the data
+```{r}
+fnames <- "GSE105094/GSE105094_RNAseq_Counts_HCT116_HKE3.txt.gz"
+
+# Check if the supplementary file already exists, if not then download it
+if (! file.exists(fnames)){
+  gse <- GEOquery::getGEO("GSE105094", GSEMatrix=FALSE)
+  sfiles = GEOquery::getGEOSuppFiles("GSE105094")
+  fnames = rownames(sfiles)
+}
+
+# Read the data into R without modifying the column names
+colorectal_countdata <- read.delim(fnames[1], header=TRUE, check.names=FALSE, sep="\t")
+
+# Show first five columns and rows of the count data
+knitr::kable(colorectal_countdata[1:5, 1:5], format="html")
+```
+
+## Calculate Summary Statistics
+```{r}
+num_samples <- dim(colorectal_countdata)[2] - 1 # How many samples do we have
+num_genes <- dim(colorectal_countdata)[1] # How many genes are measured
+num_unique_genes <- length(unique(colorectal_countdata$Gene)) # How many unique genes are measured
+num_lack_identifier <- sum(is.na(colorectal_countdata$Gene)) # How many rows do not have an identifier
+num_non_genes <- sum(! grepl("ENSG", colorectal_countdata$Gene)) # How many rows are not 
+                                                                 # classified as a human 
+                                                                 # gene by their Ensembl ID
+```
+This data set contains `r num_samples` samples and `r num_genes` genes. Of the samples, 6 are controls and 30 are treatments. Of these genes, `r num_genes - num_unique_genes` are non-unique. Also, `r num_lack_identifier` rows do not have an Ensembl ID. Finally, `r num_non_genes` all entries in the data set start with "ENSG***", and thus are classified as a human gene by their Ensembl ID. 
+
+## Filtering the data
+
+```{r}
+# Transform each entry into counts per million
+colorectal_cpms <- edgeR::cpm(colorectal_countdata[,2:ncol(colorectal_countdata)])
+rownames(colorectal_cpms) <- colorectal_countdata[,1] # Add the Ensembl IDs as rownames 
+
+# Filter out genes with low counts per million
+keep <- rowSums(colorectal_cpms > 1) >= 3 # Identify rows that have >= 3 entries with greater than 1 cpm 
+colorectal_count_filtered <- colorectal_countdata[keep,] 
+
+knitr::kable(colorectal_count_filtered[1:5, 1:5], format="html")
+
+num_remaining <- dim(colorectal_count_filtered)[1] # How many genes are left after filtration
+```
+
+Here, we used the edgeR package to transform each entry in the original dataset into their corresponding counts per million value. This is done for each sample by dividing each read count from the sample by the total number of counts of said sample. This helps us identify the genes are not highly expressed, as they are unlikely to be interesting.   
+
+Here, we filtered out `r num_genes - num_remaining` genes. Thus, only `r (num_remaining/num_genes) * 100`% of rows remain. 
+
+## Mapping the Data
+
+First, I attempted to map the Ensembl IDs of the dataset to their HGNC equivalents without filtering out low counts and using the most recent version of Ensembl. This resulted in a total of 1036 missing HGNC symbols out of `r num_samples` (approximately 1.8% of the data) and 15 duplicated symbols (see Journal). I later learned that the paper specified that the authors used Ensembl Hg38.86, corresponding to the version from October 2016. As this was unavailable, I opted to use the version from May 2015. 
+
+Thus, I remapped the data on the filtered data and used the version of Ensembl from May 2015:
+
+```{r}
+# Load the Ensembl version from May 2015 and get the human gene Ensembl ID dataset
+ensembl <- biomaRt::useMart("ensembl", host="https://may2015.archive.ensembl.org") 
+ensembl <- biomaRt::useDataset("hsapiens_gene_ensembl", mart=ensembl)
+```
+
+```{r}
+# Convert the Ensembl IDs of the filtered dataset to their HUGO gene symbols
+colorectal_hgnc_conversions <- biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                             filters = c("ensembl_gene_id"),
+                             values = colorectal_count_filtered$Gene,
+                             mart = ensembl)
+
+# Merge the HGNC conversions to the filtered dataset by matching the Ensembl IDs
+colorectal_counts_annot <- merge(colorectal_hgnc_conversions, 
+                               colorectal_count_filtered, 
+                               by.x=1, by.y=1, all.y=TRUE)
+
+knitr::kable(colorectal_counts_annot[1:5, 1:5], format="html")
+```
+
+Using the merged dataset, I then calculated the number of rows with missing HGNC symbols and the number of HGNC symbols which occur more than once in the dataset:
+
+```{r}
+# Calculate number of missing symbols
+num_missing_hgnc <- sum(is.na(colorectal_counts_annot$hgnc_symbol)) 
+
+# Calculate number of duplicated symbols
+num_duplicated_hgnc <- sum(sort(table(colorectal_counts_annot$hgnc_symbol), 
+                                decreasing=TRUE) > 1) 
+```
+
+Here, we find that there are `r num_missing_hgnc` rows with missing HGNC symbols (`r (num_missing_hgnc/nrow(colorectal_counts_annot))*100`% of rows) and `r num_duplicated_hgnc - 1` HGNC symbols with more than one occurrence in the dataset. 
+
+For the missing rows with missing values, I ultimately opted to delete them from the dataset since they represented a small subset of the data. This is for the following reasons: first, there were no other gene identifiers in the original file that I could compare the missing HGNC symbols to. Secondly, while in lecture it was specified that we can keep the missing rows in case they are interesting, the assignment specifications noted that all rows should have a unique HGNC symbol. Thus the deletion of rows with missing HGNC was done by the following:
+
+```{r}
+# Get indices of missing symbols
+missing_ind <- which(is.na(colorectal_counts_annot$hgnc_symbol)) 
+
+# Filter out missing symbols
+colorectal_counts_annot <- colorectal_counts_annot[-missing_ind,]
+```
+
+Next, I found the HGNC symbols with duplicate values in the dataset. These are summarized in the following:
+
+```{r}
+dup_genes <- sort(table(colorectal_counts_annot$hgnc_symbol), decreasing=TRUE)[2:10]
+knitr::kable(dup_genes, format="html")
+```
+
+As the paper specifically mentions ribosomal RNA, I decided not to discard RNA-8S5. Since rRNA has multiple copies across the genome, it was suggested on BioStars that I concatenate these (benformatics, 2019). 
+
+Next, I found the individual Ensembl IDs of the other genes:
+```{r}
+duplicates <- colorectal_counts_annot[which(colorectal_counts_annot$hgnc_symbol %in% c("MATR3", "CCDC7", "ICOSLG", "MIR3687-2", "PAGR1", "SMIM11", "SYT15", "TAF9")),]
+```
+
+Searching up the individual Ensembl IDs of these genes, it seems that they may be splicing variants of one another. As these are not necessarily the genes of interest from the paper, and a quick Google search has not linked any of them very strongly to colorectal cancer, I discarded all of the other duplicates. 
+
+```{r}
+# Get indices of the duplicated values
+rRNA_indices <- which(colorectal_counts_annot$hgnc_symbol == "RNA5-8S5")
+dup_ind <- c(rRNA_indices, which(colorectal_counts_annot$hgnc_symbol %in% 
+                                   c("MATR3", "CCDC7", "ICOSLG", "MIR3687-2", 
+                                     "PAGR1", "SMIM11", "SYT15", "TAF9")))
+
+# Get subset of dataset corresponding to RNA5-8S5
+rRNA_subset <- colorectal_counts_annot[rRNA_indices,]
+
+# Create new row to insert
+rRNA_row <- cbind(data.frame(ensembl_gene_id = "ENSG00000273730", hgnc_symbol = "RNA5-8S5"),
+                  t(data.frame(colSums(rRNA_subset[,c(3:38)]))))
+rownames(rRNA_row) <- NULL
+
+# Delete indices of duplicated values and add combined row for RNA5-8S5 to dataset
+colorectal_counts_final <- rbind(colorectal_counts_annot[-dup_ind,], rRNA_row)
+
+```
+
+## Cleaning the data
+First, I calculated the numerical summaries for each column:
+
+```{r}
+summary(colorectal_counts_final)
+```
+From the numerical summaries, there are no entries with a value less than zero which may indicate a technical error. Since there is no evidence otherwise of outliers, none are removed.
+
+Thus, the final dataset has `rnrow(colorectal_counts_final)` rows, and so total coverage in the dataset is `r 100*(nrow(colorectal_counts_final)/nrow(colorectal_countdata))`%.
+
+<br>
+
+
+# Normalize
+
+Normalization is required to minimize unwanted variation in the data (i.e. sources of variation that we are not testing for, such as technical variation and inherent biological variation). Here, we use the Trimmed Mean of M-values (TMM) in order to normalize the data. TMM and Relative Log Expression (RLE) are two methods specialized in normalizing RNAseq data, which I am using. Further, since from lecture the results of the two methods are comparable, I've chosen to use TMM. 
+
+## Define the Groups
+```{r}
+# Separate samples by "_" and keep the first and second indices
+samples <- data.frame(lapply(colnames(colorectal_countdata)[2:37],
+                             FUN=function(x){unlist(strsplit(x,
+                                                             split="_"))[c(1,2)]}))
+
+# Replace the column names of "samples" with the actual column names of the data
+colnames(samples) <- colnames(colorectal_countdata)[2:37]
+rownames(samples) <- c("cell_type", "time_point") 
+samples <- data.frame(t(samples)) # Flip the col and row of the dataframe
+```
+
+## Applying TMM
+```{r}
+# Turn the numerical values of the cleaned data into a matrix
+cleaned_data_matrix <- as.matrix(colorectal_counts_final[,3:38])
+rownames(cleaned_data_matrix) <- colorectal_counts_final$hgnc_symbol
+
+# Create a DGEList object
+d <- edgeR::DGEList(counts=cleaned_data_matrix, group=samples$time_point)
+d <- edgeR::calcNormFactors(d) # Calculate the scaling factors for normalization
+
+normalized_counts <- edgeR::cpm(d) # Get counts per million of the scaling factors
+```
+
+## Graphical Comparisons
+
+### Boxplot
+```{r, warning=FALSE, figures-side, fig.show="hold", out.width="50%"}
+# Get log counts per million of the pre-normalized and normalized counts
+prenorm_input <- log2(edgeR::cpm(colorectal_counts_final[,3:38]))
+postnorm_input <- log2(normalized_counts)
+
+# Create boxplot of Pre-Normalized Samples
+boxplot(prenorm_input, xlab = "Samples", ylab = "log2 CPM",
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5,
+        main = "Pre-normalized Samples")
+# Add median of the sample medians as line
+abline(h = median(apply(prenorm_input, 2, median)),
+       col = "red", lwd = 1, lty = "dashed")
+
+# Create boxplot of Normalized Samples
+boxplot(postnorm_input, xlab = "Samples", ylab = "log2 CPM",
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5,
+        main = "Normalized Samples")
+# Add median of the sample medians as line
+abline(h = median(apply(postnorm_input, 2, median)),
+       col = "red", lwd = 1, lty = "dashed")
+```
+  **Figure 1.** Comparison of boxplots between pre-normalized and normalized samples. 
+  
+Comparing the samples before and after normalization, we see that the medians of each sample boxplot are aligned much more closely with the median of the sample medians after normalization as compared to before. This is what we expect, as normalization should result in a reduction of the confounding variability (i.e. due to technical and inherent biological variation) in the data. 
+
+### Density Plots
+```{r, warning=FALSE, fig.show="hold", out.width="50%"}
+
+# Calculate the densities of the prenormalization & normalized values
+prenorm_counts_density <- apply(prenorm_input, 2, density)
+postnorm_counts_density <- apply(postnorm_input, 2, density)
+
+# Create plots
+plot_density <- function(df, title){
+  xlim <- 0; ylim <- 0 
+  for(i in 1:length(df)){
+    xlim <- range(c(xlim, df[[i]]$x))
+    ylim <- range(c(ylim, df[[i]]$y))
+  }
+  
+  cols <- rainbow(length(df)) # Get color scale
+  ltys <- rep(1.5, length(df)) # Set line type
+  
+  # Create plot with consistent x and y limits
+  plot(df[[1]], xlim=c(-10,20), ylim=c(0, 0.2), type="n",
+       ylab="Smoothing density of log2-CPM",
+       main=title, cex.lab=0.85)
+  
+  # Add each line (i.e. sample) as a different color
+  for(i in 1:length(df)){
+    lines(df[[i]], col=cols[i], lty = ltys[i])
+  }
+  
+  # Add legend
+  legend("topright", colnames(prenorm_input),
+         col=cols, lty=ltys, cex=0.4,
+         border="blue", text.col="green4",
+         merge=TRUE, bg="gray90")
+}
+
+plot_density(prenorm_counts_density, "Pre-Normalized Data")
+plot_density(postnorm_counts_density, "Normalized Data")
+```
+**Figure 2.** Comparison of the density plots of the samples before and after normalization
+
+Similarly, when comparing the density plots of the density plots before and after normalization, the curves of the normalized data seem much more aligned than the pre-normalized data. This indicates a reduction in the variability in the data, as desired.
+
+Thus from the density plots and the boxplots, we can graphically see that the variation in the data has decreased after normalization, as desired.
+
+The final dataset is therefore the following:
+
+```{r}
+knitr::kable(normalized_counts[1:5, 1:5], format="html", row.names=FALSE)
+```
+
+
+
+# Citations
+
+benformatics. (2019). Different Ensembl Ids point to the same gene symbol [Online forum post]. Biostars. https://www.biostars.org/p/389804/
+
+Canadian Cancer Society. (n.d.). Cancer statistics at a glance. Canadian Cancer Society. https://cancer.ca/en/research/cancer-statistics/cancer-statistics-at-a-glance
+
+Canadian Cancer Society. (2022). Colorectal cancer statistics. Canadian Cancer Society. https://cancer.ca/en/cancer-information/cancer-types/colorectal/statistics
+
+Charitou, T., Srihari, S., Lynn, M. A., Jarboui, M. A., Fasterius, E., Moldovan, M., Shirasawa, S., Tsunoda, T., Ueffing, M., Xie, J., Xin, J., Wang, X., Proud, C. G., Boldt, K., Al-Khalili Szigyarto, C., Kolch, W., & Lynn, D. J. (2019). Transcriptional and metabolic rewiring of colorectal cancer cells expressing the oncogenic KRASG13D mutation. British journal of cancer, 121(1), 37–50. https://doi.org/10.1038/s41416-019-0477-7
